@@ -157,14 +157,21 @@ jobs:
       # Write the minisign secret key to a tmp file with restricted perms,
       # invoke build-catalog.sh, then scrub. We can't pass key material via
       # env/stdin to minisign — it needs a file path.
+      #
+      # MINISIGN_KEY is the verbatim contents of `~/.tauri/pier.key`, which is
+      # Tauri's wrapped format: a single-line base64 blob whose decoded body
+      # is the actual minisign keyfile (comment line + key line). Pier's
+      # release workflow uses tauri-action which unwraps this internally; here
+      # we feed raw `minisign`, so we must base64-decode before writing.
       - name: Build signed catalog
         env:
           RELEASE_TAG: ${{ github.ref_name }}
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           set -euo pipefail
           umask 077
-          printf '%s' "${{ secrets.MINISIGN_KEY }}" > /tmp/pier.key
+          printf '%s' "$MINISIGN_KEY" | base64 --decode > /tmp/pier.key
           MINISIGN_KEY_PATH=/tmp/pier.key ./scripts/build-catalog.sh
           rm -f /tmp/pier.key
 
