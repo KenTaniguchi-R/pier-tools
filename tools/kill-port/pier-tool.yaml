@@ -1,0 +1,16 @@
+id: kill-port
+name: Kill process on port
+version: 1.0.0
+description: Free up a port held by a stuck process.
+category: dev
+tier: beginner
+permissions:
+  network: false
+  fsRead: []
+  fsWrite: []
+params:
+  - id: port
+    label: Port
+    type: number
+    min: 1
+    max: 65535

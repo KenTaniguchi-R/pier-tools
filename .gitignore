@@ -1,0 +1,23 @@
+# Build artifacts
+dist/
+target/
+node_modules/
+
+# Generated
+catalog.json
+catalog.json.minisig
+
+# Local
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Go
+*.exe
+*.test
+*.out
+
+# Editor
+.idea/
+.vscode/

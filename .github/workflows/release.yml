@@ -1,0 +1,64 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: macos-14
+    permissions:
+      contents: write   # for creating the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+
+      # Apple Developer ID + notarization secrets — copy verbatim from pier's release.yml.
+      # APPLE_CERTIFICATE: base64-encoded .p12
+      # APPLE_CERTIFICATE_PASSWORD
+      # APPLE_SIGNING_IDENTITY: e.g. "Developer ID Application: Benri LLC (Q272ZH2Z42)"
+      # APPLE_ID, APPLE_PASSWORD (app-specific), APPLE_TEAM_ID
+      - name: Import Apple cert
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # TODO: copy the import block from pier/.github/workflows/release.yml
+          echo "TODO: import certificate into a temp keychain"
+
+      - name: Build + sign + notarize all Go tools
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          for d in tools/*/; do
+            if [ -f "$d/.goreleaser.yaml" ]; then
+              echo "::group::Building $d"
+              (cd "$d" && goreleaser release --clean --skip=publish || goreleaser build --clean --snapshot)
+              echo "::endgroup::"
+            fi
+          done
+
+      - name: Generate signed catalog.json
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          ./scripts/build-catalog.sh
+
+      - name: Publish catalog to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          set -eu
+          aws s3 cp catalog.json "s3://library/catalog.json" --endpoint-url "$R2_ENDPOINT"
+          aws s3 cp catalog.json.minisig "s3://library/catalog.json.minisig" --endpoint-url "$R2_ENDPOINT"

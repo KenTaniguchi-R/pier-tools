@@ -1,0 +1,25 @@
+version: 2
+project_name: jwt-decode
+builds:
+  - id: jwt-decode
+    main: ./
+    binary: jwt-decode
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin]
+    goarch: [arm64, amd64]
+    flags: [-trimpath]
+    ldflags: [-s, -w]
+universal_binaries:
+  - id: jwt-decode-universal
+    ids: [jwt-decode]
+    replace: true
+    name_template: "jwt-decode"
+archives:
+  - id: jwt-decode
+    formats: [binary]
+    name_template: "{{ .ProjectName }}-{{ .Os }}-universal"
+checksum:
+  name_template: "jwt-decode-checksums.txt"
+release:
+  disable: false
