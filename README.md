@@ -1,6 +1,6 @@
 # pier-tools
 
-Curated tool catalog for [Pier](https://github.com/benree-labs/pier).
+Curated tool catalog for [Pier](https://github.com/KenTaniguchi-R/pier).
 
 Each tool lives under `tools/<id>/`:
 - `pier-tool.yaml` — Aqua-shaped manifest (id, version, permissions, params)
