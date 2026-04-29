@@ -1,64 +1,188 @@
 name: release
+
+# Triggered by tagging a vX.Y.Z release. Builds every Go tool under tools/,
+# codesigns + notarizes the universal Mach-O, attaches it to the GitHub
+# Release, generates a signed catalog.json, and ships catalog.json +
+# catalog.json.minisig to Cloudflare R2 (S3-compatible).
+
 on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write   # gh release create / upload
+
 jobs:
   build:
     runs-on: macos-14
-    permissions:
-      contents: write   # for creating the GitHub Release
+    env:
+      # Fail-fast on undefined vars in shell snippets.
+      DEBIAN_FRONTEND: noninteractive
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4   # TODO: pin to SHA later
 
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.22" }
+      - uses: actions/setup-go@v5   # TODO: pin to SHA later
+        with:
+          go-version: "1.22"
 
-      # Apple Developer ID + notarization secrets — copy verbatim from pier's release.yml.
-      # APPLE_CERTIFICATE: base64-encoded .p12
-      # APPLE_CERTIFICATE_PASSWORD
-      # APPLE_SIGNING_IDENTITY: e.g. "Developer ID Application: Benri LLC (Q272ZH2Z42)"
-      # APPLE_ID, APPLE_PASSWORD (app-specific), APPLE_TEAM_ID
-      - name: Import Apple cert
+      # Pre-installed on macos-14 runners except minisign + yq. brew install is
+      # idempotent — pre-existing formulae are silently skipped.
+      - name: Install tooling
+        run: |
+          set -euo pipefail
+          brew install yq minisign goreleaser/tap/goreleaser jq
+
+      # Standard temp-keychain recipe: import the .p12, mark codesign as an
+      # allowed partition consumer so signing doesn't prompt. The keychain is
+      # discarded with the runner.
+      - name: Import Apple Developer ID cert
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}-keychain-password
         run: |
-          # TODO: copy the import block from pier/.github/workflows/release.yml
-          echo "TODO: import certificate into a temp keychain"
+          set -euo pipefail
+          echo "$APPLE_CERTIFICATE" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import /tmp/cert.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain >/dev/null
+          rm /tmp/cert.p12
 
-      - name: Build + sign + notarize all Go tools
+      # `goreleaser build` (not `release`) because we publish artifacts ourselves
+      # via gh release upload — the per-tool .goreleaser.yaml is build-only.
+      # Default (no --single-target) builds every configured target so
+      # universal_binaries can fuse arm64+amd64 into one fat binary.
+      - name: Build all Go tools
+        run: |
+          set -euo pipefail
+          for d in tools/*/; do
+            if [ -f "$d/.goreleaser.yaml" ]; then
+              echo "::group::goreleaser build $d"
+              (cd "$d" && goreleaser build --clean --snapshot)
+              echo "::endgroup::"
+            fi
+          done
+
+      # Codesign + notarize each universal Mach-O.
+      #
+      # Note on stapling: standalone Mach-O binaries CANNOT be `xcrun stapler
+      # staple`'d — only .app/.pkg/.dmg containers can carry the stapled
+      # ticket. Notarization is still recorded server-side and Gatekeeper
+      # consults syspolicyd online when a quarantined file is opened. In our
+      # case Pier downloads tools via URLSession into ~/.pier/tools/ and
+      # exec's them with posix_spawn, so Gatekeeper never gates execution.
+      # Notarization here is defense-in-depth (and so users can manually run
+      # the binary from a Terminal without an "unidentified developer" prompt).
+      - name: Codesign + notarize Go tool binaries
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -eu
+          set -euo pipefail
           for d in tools/*/; do
-            if [ -f "$d/.goreleaser.yaml" ]; then
-              echo "::group::Building $d"
-              (cd "$d" && goreleaser release --clean --skip=publish || goreleaser build --clean --snapshot)
-              echo "::endgroup::"
+            id="$(basename "$d")"
+            [ -f "$d/.goreleaser.yaml" ] || continue
+            primary="$d/dist/${id}-darwin-universal_${id}-universal_darwin_all/${id}"
+            if [ -x "$primary" ]; then
+              bin="$primary"
+            else
+              bin="$(find "$d/dist" -type f -name "$id" \
+                -not -path '*/metadata/*' \
+                -not -path '*/artifacts/*' \
+                -not -path '*/config/*' \
+                | head -n 1)"
             fi
+            if [ -z "${bin:-}" ] || [ ! -x "$bin" ]; then
+              echo "::error::no built binary for $id under $d/dist/" >&2
+              exit 1
+            fi
+            echo "signing $bin"
+            codesign --force --options runtime --timestamp \
+              --sign "$APPLE_SIGNING_IDENTITY" "$bin"
+            # notarytool needs a zip (or pkg/dmg). We zip with `ditto -c -k
+            # --keepParent` per Apple's recommendation for CLI tools.
+            ditto -c -k --keepParent "$bin" "$bin.zip"
+            echo "notarizing $bin.zip"
+            xcrun notarytool submit "$bin.zip" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+            rm "$bin.zip"
           done
 
-      - name: Generate signed catalog.json
+      # gh release create is idempotent thanks to `|| true` — re-runs of the
+      # same tag just re-upload assets. The `#asset-name` syntax on `gh
+      # release upload` renames the asset at upload time, which is how we
+      # produce the `<id>-darwin-universal` URL pattern that build-catalog.sh
+      # references.
+      - name: Create + populate GitHub Release
         env:
-          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          set -eu
-          ./scripts/build-catalog.sh
+          set -euo pipefail
+          gh release create "$REF_NAME" \
+            --title "pier-tools $REF_NAME" \
+            --notes "Auto-generated release." || true
 
+          for d in tools/*/; do
+            id="$(basename "$d")"
+            [ -f "$d/.goreleaser.yaml" ] || continue
+            primary="$d/dist/${id}-darwin-universal_${id}-universal_darwin_all/${id}"
+            if [ -x "$primary" ]; then
+              bin="$primary"
+            else
+              # find -perm +111 = "any exec bit set" on macOS / BSD find.
+              # This step only runs on macos-14, so portability is fine.
+              bin="$(find "$d/dist" -type f -perm +111 -name "$id" \
+                -not -path '*/metadata/*' \
+                -not -path '*/artifacts/*' \
+                -not -path '*/config/*' \
+                | head -n 1)"
+            fi
+            if [ -z "${bin:-}" ]; then
+              echo "::error::no binary for $id" >&2
+              exit 1
+            fi
+            echo "uploading $bin as ${id}-darwin-universal"
+            gh release upload "$REF_NAME" "${bin}#${id}-darwin-universal" --clobber
+          done
+
+      # Write the minisign secret key to a tmp file with restricted perms,
+      # invoke build-catalog.sh, then scrub. We can't pass key material via
+      # env/stdin to minisign — it needs a file path.
+      - name: Build signed catalog
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "${{ secrets.MINISIGN_KEY }}" > /tmp/pier.key
+          MINISIGN_KEY_PATH=/tmp/pier.key ./scripts/build-catalog.sh
+          rm -f /tmp/pier.key
+
+      # R2 is S3-compatible; aws-cli (pre-installed on macos-14) speaks it
+      # natively when given --endpoint-url. 5-minute cache lets clients pick
+      # up new releases quickly while still benefitting from CDN edge caching.
       - name: Publish catalog to R2
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
         run: |
-          set -eu
-          aws s3 cp catalog.json "s3://library/catalog.json" --endpoint-url "$R2_ENDPOINT"
-          aws s3 cp catalog.json.minisig "s3://library/catalog.json.minisig" --endpoint-url "$R2_ENDPOINT"
+          set -euo pipefail
+          aws s3 cp catalog.json "s3://${{ secrets.R2_BUCKET }}/catalog.json" \
+            --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+            --content-type application/json \
+            --cache-control "public, max-age=300"
+          aws s3 cp catalog.json.minisig "s3://${{ secrets.R2_BUCKET }}/catalog.json.minisig" \
+            --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+            --content-type application/octet-stream \
+            --cache-control "public, max-age=300"
