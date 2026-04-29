@@ -150,8 +150,14 @@ jobs:
               echo "::error::no binary for $id" >&2
               exit 1
             fi
-            echo "uploading $bin as ${id}-darwin-universal"
-            gh release upload "$REF_NAME" "${bin}#${id}-darwin-universal" --clobber
+            # `gh release upload path#label` only sets the display label, not
+            # the on-disk filename used in the download URL. Copy to the
+            # canonical name first so the URL matches build-catalog.sh's
+            # ASSET_BASE/<id>-darwin-universal pattern.
+            staged="$(dirname "$bin")/${id}-darwin-universal"
+            cp "$bin" "$staged"
+            echo "uploading $staged"
+            gh release upload "$REF_NAME" "$staged" --clobber
           done
 
       # Write the minisign secret key to a tmp file with restricted perms,
