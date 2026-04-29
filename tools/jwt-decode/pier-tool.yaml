@@ -1,0 +1,14 @@
+id: jwt-decode
+name: JWT decode
+version: 1.0.0
+description: Paste a JWT — see the header and payload pretty-printed (offline, no signature check).
+category: dev
+tier: beginner
+permissions:
+  network: false
+  fsRead: []
+  fsWrite: []
+params:
+  - id: token
+    label: Token
+    type: text
